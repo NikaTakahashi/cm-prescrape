@@ -35,6 +35,9 @@ SUBDIRS = ("boxarts", "snaps", "titles", "logos")
 SUBDIR_PATH = {"boxarts": "Named_Boxarts", "snaps": "Named_Snaps",
                "titles": "Named_Titles", "logos": "Named_Logos"}
 
+# Listings cache TTL (seconds). Empty/failed listings are never cached.
+CACHE_TTL = 7 * 24 * 3600
+
 # Extensions that are NOT ROMs (ignored when scanning)
 NON_ROM_EXTS = {
     ".cue", ".sbi", ".srm", ".m3u", ".m3u8", ".txt", ".xml", ".nfo", ".pdf",
@@ -56,8 +59,8 @@ REGION_FIX = [
 # embedded in ConsoleMode_arm + the real CDN index)
 SYSTEM_MAP = {
     "3DO": "The 3DO Company - 3DO",
-    "Amiga": "Commodore - Amiga",
-    "Amstrad": "Amstrad - CPC",
+    "Amiga": ("Commodore - Amiga", "Commodore - CD32", "Commodore - CDTV"),
+    "Amstrad": ("Amstrad - CPC", "Amstrad - GX4000"),
     "Arcadia": "Emerson - Arcadia 2001",
     "Arduboy": "Arduboy Inc - Arduboy",
     "Atari2600": "Atari - 2600",
@@ -69,10 +72,12 @@ SYSTEM_MAP = {
     "AVision": "Entex - Adventure Vision",
     "C64": "Commodore - 64",
     "Casio_PV-1000": "Casio - PV-1000",
+    "C16": "Commodore - Plus-4",        # C16/116/Plus-4 share the core and CDN folder
     "CD-i": "Philips - CD-i",
     "ChannelF": "Fairchild - Channel F",
     "Coleco": "Coleco - ColecoVision",
     "CreatiVision": "VTech - CreatiVision",
+    "EpochGalaxyII": "Handheld Electronic Game",   # dedicated LCD handheld
     "Game And Watch": "Handheld Electronic Game",
     "GameNWatch": "Handheld Electronic Game",
     "Gameboy": "Nintendo - Game Boy",
@@ -82,20 +87,22 @@ SYSTEM_MAP = {
     "GBA": "Nintendo - Game Boy Advance",
     "GBA2P": "Nintendo - Game Boy Advance",
     "GBC": "Nintendo - Game Boy Color",
-    "SGB": "Nintendo - Game Boy Color",
+    "SGB": ("Nintendo - Game Boy Color", "Nintendo - Game Boy"),
+    "MegaDuck": "Hartung - Game Master",   # Mega Duck/Cougar Boy artwork lives here
     "Intellivision": "Mattel - Intellivision",
     "Jaguar": "Atari - Jaguar",
     "Lynx48": "Atari - Lynx",
-    "Mame": "MAME",
+    "Mame": ("MAME", "FBNeo - Arcade Games"),   # FBNeo fallback for arcade sets
     "MegaCD": "Sega - Mega-CD - Sega CD",
     "MegaDrive": "Sega - Mega Drive - Genesis",
-    "MSX": "Microsoft - MSX",
+    "MSX": ("Microsoft - MSX", "Microsoft - MSX2"),
     "MSX1": "Microsoft - MSX",
+    "NES": ("Nintendo - Nintendo Entertainment System", "Nintendo - Family Computer Disk System"),
+    "NGPC": "SNK - Neo Geo Pocket Color",
     "N64": "Nintendo - Nintendo 64",
     "NeoGeo": "SNK - Neo Geo",
     "NeoGeo-CD": "SNK - Neo Geo CD",
-    "NES": "Nintendo - Nintendo Entertainment System",
-    "NGPC": "SNK - Neo Geo Pocket Color",
+    "PocketChallengeV2": "Bandai - WonderSwan",   # WonderSwan clone; games live there
     "Odyssey2": "Magnavox - Odyssey2",
     "PC8801": "NEC - PC-8001 - PC-8801",
     "PET2001": "Commodore - PET",
@@ -106,14 +113,15 @@ SYSTEM_MAP = {
     "SCV": "Epoch - Super Cassette Vision",
     "SG1000": "Sega - SG-1000",
     "SMS": "Sega - Master System - Mark III",
-    "SNES": "Nintendo - Super Nintendo Entertainment System",
+    "SNES": ("Nintendo - Super Nintendo Entertainment System", "Nintendo - Sufami Turbo",
+             "Nintendo - Satellaview"),
     "Spectrum": "Sinclair - ZX Spectrum",
     "ZXNext": "Sinclair - ZX Spectrum",
     "SPMX": "Sega - PICO",
     "Studio-II": "RCA - Studio II",
     "SuperVision": "Watara - Supervision",
     "SVI328": "Spectravideo - SVI-318 - SVI-328",
-    "TGFX16": "NEC - PC Engine - TurboGrafx 16",
+    "TGFX16": ("NEC - PC Engine - TurboGrafx 16", "NEC - PC Engine SuperGrafx"),
     "TGFX16-CD": "NEC - PC Engine CD - TurboGrafx-CD",
     "VECTREX": "GCE - Vectrex",
     "VIC20": "Commodore - VIC-20",
@@ -132,6 +140,17 @@ def log(msg):
 
 def normalize(s):
     return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
+
+def strip_groups(s):
+    """Remove [bracket] and (paren) groups: 'Ace of Aces (NTSC) (Atari) (1988)' -> 'Ace of Aces'."""
+    s = re.sub(r"\[[^\]]*\]", " ", s)
+    s = re.sub(r"\([^)]*\)", " ", s)
+    return s
+
+
+def loose_key(s):
+    return normalize(strip_groups(s))
 
 
 def http_get(url, timeout, retries):
@@ -218,24 +237,31 @@ def menu_source(cfg, interactive):
 
 
 # ------------------------------------------------------------ CDN detection
+def _as_tuple(v):
+    return v if isinstance(v, tuple) else (v,)
+
+
 def cdn_index(cache_dir, timeout, retries):
-    """List of system folders available on the CDN (with local cache)."""
+    """List of system folders available on the CDN (with local cache + TTL)."""
     os.makedirs(cache_dir, exist_ok=True)
     path = os.path.join(cache_dir, "__root.json")
-    if os.path.exists(path):
+    if os.path.exists(path) and time.time() - os.path.getmtime(path) < CACHE_TTL:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            if data:
+                return data
     data = http_get(CDN + "/", timeout, retries)
     systems = []
     for m in re.finditer(r'href="([^"?/]+)/"', data.decode("utf-8", "replace")):
         systems.append(urllib.parse.unquote(m.group(1)))
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(systems, f, ensure_ascii=False)
+    if systems:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(systems, f, ensure_ascii=False)
     return systems
 
 
 def detect_platforms(games_root, cdn_systems):
-    """Returns {mister_folder: cdn_folder} for systems with artwork coverage."""
+    """Returns {mister_folder: (cdn_folder, ...)} for systems with artwork coverage."""
     detection = {}
     norm_cdn = {normalize(s): s for s in cdn_systems}
     for folder in sorted(os.listdir(games_root)):
@@ -243,13 +269,15 @@ def detect_platforms(games_root, cdn_systems):
         if not os.path.isdir(path) or folder == "media":
             continue
         cdn = SYSTEM_MAP.get(folder)
-        if cdn and cdn in cdn_systems:
-            detection[folder] = cdn
+        if cdn:
+            folders = tuple(c for c in _as_tuple(cdn) if c in cdn_systems)
+            if folders:
+                detection[folder] = folders
             continue
         # automatic match by normalized name
         n = normalize(folder)
         if n in norm_cdn:
-            detection[folder] = norm_cdn[n]
+            detection[folder] = (norm_cdn[n],)
     return detection
 
 
@@ -258,17 +286,21 @@ def load_listing(cache_dir, cdn_folder, subdir, timeout, retries):
     os.makedirs(cache_dir, exist_ok=True)
     safe = re.sub(r"[^A-Za-z0-9_-]+", "_", cdn_folder)
     path = os.path.join(cache_dir, f"{safe}__{subdir}.json")
-    if os.path.exists(path):
+    # Cache hit only if fresh AND non-empty (a failed fetch used to poison the cache)
+    if os.path.exists(path) and time.time() - os.path.getmtime(path) < CACHE_TTL:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            names = json.load(f)
+            if names:
+                return names
     url = f"{CDN}/{urllib.parse.quote(cdn_folder)}/{SUBDIR_PATH[subdir]}/"
     try:
         names = parse_listing(http_get(url, timeout, retries))
     except Exception as e:  # noqa: BLE001
         log(f"  WARNING: no {subdir} listing for '{cdn_folder}' ({e})")
-        names = []
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(names, f, ensure_ascii=False)
+        return []
+    if names:  # never cache empty results
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(names, f, ensure_ascii=False)
     return names
 
 
@@ -374,23 +406,52 @@ def optimize_pass(games_root, max_w, max_h, force=False):
     return total
 
 
-def candidates(base, ci_index):
-    """Tries the exact name and region variants. -> PNG name or None"""
-    tried = set()
+def _rank(name):
+    """Lower is better when several CDN images share the same loose key."""
+    n = name.lower()
+    score = 0
+    if re.search(r"\(usa", n):
+        score -= 4
+    if re.search(r"\(world\)", n):
+        score -= 3
+    if re.search(r"\(europe", n):
+        score -= 2
+    if re.search(r"\(japan", n):
+        score += 1
+    if re.search(r"proto|beta|alt |pirate|unl|hack|demo|sample|\[b\]", n):
+        score += 5
+    return score
 
-    def try_name(name):
-        k = name.lower()
-        if k in tried:
-            return None
-        tried.add(k)
-        return ci_index.get(k + ".png")
 
-    hit = try_name(base)
+def build_index(cdn, names):
+    """key -> (cdn_folder, png_name). Keys: exact, loose (no brackets/parens),
+    and NeoGeo-style alt-title head ('Aero Fighters 2 _ Sonic Wings 2')."""
+    idx = {}
+
+    def put(k, n):
+        k = k.strip().lower()
+        if not k:
+            return
+        cur = idx.get(k)
+        if cur is None or _rank(n) < _rank(cur[1]):
+            idx[k] = (cdn, n)
+
+    for n in names:
+        base = n[:-4] if n.lower().endswith(".png") else n
+        put(base, n)
+        put(loose_key(base), n)
+        put(loose_key(re.split(r"\s+_\s+", base)[0]), n)
+    return idx
+
+
+def candidates(base, idx):
+    """-> (cdn_folder, png_name) or None. Exact/region variants first, then loose."""
+    hit = idx.get(base.lower())
     if hit:
         return hit
     for src, dst in REGION_FIX:
         if base.endswith(src):
-            hit = try_name(base[: -len(src)] + dst)
+            hit = idx.get((base[: -len(src)] + dst).lower())
             if hit:
                 return hit
     m = re.match(r"^(.*)\(([^()]+)\)$", base)
@@ -398,11 +459,14 @@ def candidates(base, ci_index):
         parts = m.group(2).split(",")
         if len(parts) > 1:
             for p in parts:
-                hit = try_name(m.group(1) + "(" + p.strip() + ")")
+                hit = idx.get((m.group(1) + "(" + p.strip() + ")").lower())
                 if hit:
                     return hit
-            hit = try_name(m.group(1).rstrip())
-    return hit
+            hit = idx.get(m.group(1).rstrip().lower())
+            if hit:
+                return hit
+    # loose match: ROM 'Ace of Aces (NTSC) (Atari) (1988)' -> 'ace of aces'
+    return idx.get(loose_key(base))
 
 
 # ---------------------------------------------------------------------- main
@@ -472,7 +536,7 @@ def main():
     detection = detect_platforms(games_root, cdn_systems)
     log(f"{len(detection)} of your folders have artwork on the CDN:")
     for k in sorted(detection):
-        log(f"  games/{k:20s} -> {detection[k]}")
+        log(f"  games/{k:20s} -> {' + '.join(detection[k])}")
     no_coverage = sorted(set(os.listdir(games_root)) - set(detection) - {"media"})
     log(f"No CDN coverage ({len(no_coverage)}): {', '.join(no_coverage[:12])}"
         + (" ..." if len(no_coverage) > 12 else ""))
@@ -497,20 +561,21 @@ def main():
         log("No systems to process.")
         sys.exit(0)
 
-    # 2) Load CDN listings per system and chosen source
+    # 2) Load CDN listings per system (all its CDN folders) and build match indexes
     log(f"Loading listings (source={source}, background={background})...")
     listings = {}
-    for system, cdn in sorted(detection.items()):
+    for system, cdn_folders in sorted(detection.items()):
         t0 = time.time()
-        main = load_listing(cache_dir, cdn, source, cfg["timeout"], cfg["retries"])
-        bg_n = [] if background == "none" or background == source else \
-            load_listing(cache_dir, cdn, background, cfg["timeout"], cfg["retries"])
-        listings[system] = {
-            "cdn": cdn,
-            "main": {n.lower(): n for n in main},
-            "bg": {n.lower(): n for n in bg_n},
-        }
-        log(f"  {system:20s} {len(main):6d} {source}, {len(bg_n):6d} {background}  ({time.time()-t0:.1f}s)")
+        main_idx, bg_idx = {}, {}
+        for cdn in cdn_folders:
+            main = load_listing(cache_dir, cdn, source, cfg["timeout"], cfg["retries"])
+            main_idx.update(build_index(cdn, main))
+            if background != "none" and background != source:
+                bg_n = load_listing(cache_dir, cdn, background, cfg["timeout"], cfg["retries"])
+                bg_idx.update(build_index(cdn, bg_n))
+        listings[system] = {"main": main_idx, "bg": bg_idx}
+        log(f"  {system:20s} {len(main_idx):6d} {source} keys, "
+            f"{len(bg_idx):6d} {background} keys  ({time.time()-t0:.1f}s)")
 
     # 3) Scan ROMs and prepare download jobs
     log("Scanning ROMs and matching artwork...")
@@ -525,8 +590,8 @@ def main():
         if not p and not b:
             misses.setdefault(system, []).append(base)
             continue
-        url_p = f"{CDN}/{urllib.parse.quote(info['cdn'])}/{SUBDIR_PATH[source]}/{urllib.parse.quote(p)}" if p else None
-        url_b = f"{CDN}/{urllib.parse.quote(info['cdn'])}/{SUBDIR_PATH[background]}/{urllib.parse.quote(b)}" if b else None
+        url_p = f"{CDN}/{urllib.parse.quote(p[0])}/{SUBDIR_PATH[source]}/{urllib.parse.quote(p[1])}" if p else None
+        url_b = f"{CDN}/{urllib.parse.quote(b[0])}/{SUBDIR_PATH[background]}/{urllib.parse.quote(b[1])}" if b else None
         jobs.append((system, rom_dir, base, url_p, url_b))
 
     log(f"ROMs scanned: {total_roms}   with artwork available: {len(jobs)}   without artwork: {total_roms - len(jobs)}")
