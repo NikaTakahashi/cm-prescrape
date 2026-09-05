@@ -8,3 +8,5 @@ no_artwork.csv
 # Python
 __pycache__/
 *.pyc
+*.log
+
