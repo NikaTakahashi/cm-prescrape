@@ -19,9 +19,11 @@ Usage:
 import argparse
 import configparser
 import csv
+import io
 import json
 import os
 import re
+import struct
 import sys
 import threading
 import time
@@ -353,6 +355,40 @@ def scan_roms(games_root, detection, limit_per_system):
 
 
 # ------------------------------------------------------------- optimization
+_CPP_HDR = struct.Struct(">I4s")
+
+
+def sanitize_png(path):
+    """Some libretro CDN PNGs carry huge/broken ancillary chunks (zTXt EXIF,
+    duplicated iCCP) that Pillow refuses to open. Rewrite keeping only the
+    critical chunks, then re-encode cleanly. Returns True on success."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return False
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+        if data[:8] != b"\x89PNG\r\n\x1a\n":
+            return False
+        keep = {b"IHDR", b"PLTE", b"tRNS", b"IDAT", b"IEND"}
+        out = [data[:8]]
+        pos = 8
+        while pos + 12 <= len(data):
+            ln, typ = _CPP_HDR.unpack_from(data, pos)
+            if typ == b"IEND":
+                out.append(data[pos:pos + 12])
+                break
+            if typ in keep:
+                out.append(data[pos:pos + 12 + ln])
+            pos += 12 + ln
+        with Image.open(io.BytesIO(b"".join(out))) as im:
+            im.save(path, "PNG", optimize=True)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def optimize_image(src, dst, max_w, max_h):
     """Downscale src into dst (media/optimized/) like Console Mode's Optimize Artwork."""
     try:
@@ -361,10 +397,18 @@ def optimize_image(src, dst, max_w, max_h):
         return "no-pillow"
     try:
         os.makedirs(os.path.dirname(dst), exist_ok=True)
-        with Image.open(src) as im:
-            im = im.convert("RGBA") if im.mode in ("P", "LA") else im
-            im.thumbnail((max_w, max_h), Image.LANCZOS)
-            im.save(dst, "PNG")
+        try:
+            with Image.open(src) as im:
+                im = im.convert("RGBA") if im.mode in ("P", "LA") else im
+                im.thumbnail((max_w, max_h), Image.LANCZOS)
+                im.save(dst, "PNG")
+        except Exception:  # noqa: BLE001
+            if not sanitize_png(src):
+                return "fail"
+            with Image.open(src) as im:
+                im = im.convert("RGBA") if im.mode in ("P", "LA") else im
+                im.thumbnail((max_w, max_h), Image.LANCZOS)
+                im.save(dst, "PNG")
         return "ok"
     except Exception:  # noqa: BLE001
         return "fail"
