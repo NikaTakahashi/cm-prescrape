@@ -1,0 +1,10 @@
+# Local cache of CDN listings
+cache/
+
+# Generated reports
+download_report.csv
+no_artwork.csv
+
+# Python
+__pycache__/
+*.pyc
