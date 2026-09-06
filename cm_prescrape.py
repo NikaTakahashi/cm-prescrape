@@ -135,6 +135,12 @@ SYSTEM_MAP = {
 }
 
 
+# CDN folders used for arcade artwork (MiSTer _Arcade/*.mra + games/Mame zips).
+# The CDN uses long titles ('After Burner II.png'), so MRAs match by basename
+# (or their <name> tag) while short MAME zips match via nospace keys.
+ARCADE_CDN = ("MAME", "FBNeo - Arcade Games")
+
+
 # ------------------------------------------------------------------ helpers
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -153,6 +159,12 @@ def strip_groups(s):
 
 def loose_key(s):
     return normalize(strip_groups(s))
+
+
+def nospace_key(s):
+    """normalize() without spaces: '280Z-ZZAP' -> '280zzzap'.
+    Arcade short names (MAME zips, MRA setnames) often drop the spaces."""
+    return normalize(s).replace(" ", "")
 
 
 def http_get(url, timeout, retries):
@@ -203,6 +215,8 @@ def load_config(cfg_path):
         "main_source": g("download", "main_source", "boxarts").lower(),
         "bg_source": g("download", "bg_source", "snaps").lower(),
         "systems": g("download", "systems", ""),
+        "arcade_enabled": g("arcade", "enabled", "1") in ("1", "true", "yes"),
+        "arcade_alternatives": g("arcade", "include_alternatives", "0") in ("1", "true", "yes"),
         "force": g("download", "force", "0") in ("1", "true", "yes"),
         "retries": int(g("network", "retries", "3")),
         "timeout": int(g("network", "timeout", "30")),
@@ -313,6 +327,52 @@ def find_games_dir(sd_root):
         if os.path.isdir(p):
             return p
     return None
+
+
+def parse_mra_name(mra_path):
+    """Extract the <name> tag from a .mra file (used as fallback match key)."""
+    try:
+        with open(mra_path, "r", encoding="utf-8", errors="replace") as fh:
+            head = fh.read(8192)
+        m = re.search(r"<name>(.*?)</name>", head, re.DOTALL)
+        if m:
+            return re.sub(r"\s+", " ", m.group(1)).strip()
+    except OSError:
+        pass
+    return None
+
+
+def scan_arcade(arcade_root, include_alternatives, limit=0):
+    """Yields (rom_dir, base, mra_path) for every .mra.
+    Artwork is stored next to each file: <dir with the .mra>/media/<base>.png
+    (same convention Console Mode uses for every other system)."""
+    n = 0
+    try:
+        top = sorted(os.listdir(arcade_root))
+    except OSError:
+        return
+    for e in top:
+        if not e.lower().endswith(".mra"):
+            continue
+        full = os.path.join(arcade_root, e)
+        if not os.path.isfile(full):
+            continue
+        yield arcade_root, os.path.splitext(e)[0], full
+        n += 1
+        if limit and n >= limit:
+            return
+    if include_alternatives:
+        alt_root = os.path.join(arcade_root, "_alternatives")
+        for root, dirs, files in os.walk(alt_root):
+            dirs[:] = sorted(d for d in dirs if d != "media")
+            for e in sorted(files):
+                if not e.lower().endswith(".mra"):
+                    continue
+                full = os.path.join(root, e)
+                yield root, os.path.splitext(e)[0], full
+                n += 1
+                if limit and n >= limit:
+                    return
 
 
 def rom_bases_in(dirpath):
@@ -469,7 +529,8 @@ def _rank(name):
 
 def build_index(cdn, names):
     """key -> (cdn_folder, png_name). Keys: exact, loose (no brackets/parens),
-    and NeoGeo-style alt-title head ('Aero Fighters 2 _ Sonic Wings 2')."""
+    nospace variants of both, and NeoGeo-style alt-title head
+    ('Aero Fighters 2 _ Sonic Wings 2')."""
     idx = {}
 
     def put(k, n):
@@ -484,7 +545,11 @@ def build_index(cdn, names):
         base = n[:-4] if n.lower().endswith(".png") else n
         put(base, n)
         put(loose_key(base), n)
-        put(loose_key(re.split(r"\s+_\s+", base)[0]), n)
+        put(nospace_key(base), n)
+        put(nospace_key(loose_key(base)), n)
+        head = loose_key(re.split(r"\s+_\s+", base)[0])
+        put(head, n)
+        put(nospace_key(head), n)
     return idx
 
 
@@ -510,7 +575,14 @@ def candidates(base, idx):
             if hit:
                 return hit
     # loose match: ROM 'Ace of Aces (NTSC) (Atari) (1988)' -> 'ace of aces'
-    return idx.get(loose_key(base))
+    hit = idx.get(loose_key(base))
+    if hit:
+        return hit
+    # nospace match: '280Z-ZZAP (US)' -> '280zzzap', '3wonders.zip' -> '3 wonders'
+    hit = idx.get(nospace_key(base))
+    if hit:
+        return hit
+    return idx.get(nospace_key(loose_key(base)))
 
 
 # ---------------------------------------------------------------------- main
@@ -524,6 +596,8 @@ def main():
     ap.add_argument("--jobs", type=int, default=0)
     ap.add_argument("--source", choices=SUBDIRS, default="", help="main artwork source")
     ap.add_argument("--bg", default="", choices=SUBDIRS + ("none",), help="background source")
+    ap.add_argument("--no-arcade", action="store_true", help="skip MiSTer _Arcade/*.mra scraping")
+    ap.add_argument("--arcade-only", action="store_true", help="only scrape MiSTer _Arcade/*.mra")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--optimize-only", action="store_true",
                     help="only generate optimized thumbnails for already downloaded artwork")
@@ -560,6 +634,9 @@ def main():
     # --optimize-only: just generate optimized thumbnails and exit
     if args.optimize_only:
         optimize_pass(games_root, cfg["opt_max_w"], cfg["opt_max_h"], force=cfg["force"])
+        arcade_root = os.path.join(sd_root, "_Arcade")
+        if os.path.isdir(arcade_root):
+            optimize_pass(arcade_root, cfg["opt_max_w"], cfg["opt_max_h"], force=cfg["force"])
         return
 
     log(f"SD root      : {sd_root}")
@@ -581,6 +658,19 @@ def main():
     log(f"{len(detection)} of your folders have artwork on the CDN:")
     for k in sorted(detection):
         log(f"  games/{k:20s} -> {' + '.join(detection[k])}")
+
+    # Arcade lives outside games/: sd_root/_Arcade/*.mra (MiSTer arcade folder)
+    arcade_root = os.path.join(sd_root, "_Arcade")
+    arcade_cdns = tuple(c for c in ARCADE_CDN if c in cdn_systems)
+    do_arcade = (cfg["arcade_enabled"] and not args.no_arcade
+                 and os.path.isdir(arcade_root) and bool(arcade_cdns))
+    if args.arcade_only:
+        detection = {}
+        if not do_arcade:
+            log(f"ERROR: --arcade-only but no usable _Arcade folder in {sd_root}")
+            sys.exit(1)
+    if do_arcade:
+        log(f"  {'_Arcade':25s} -> {' + '.join(arcade_cdns)}  ({arcade_root})")
     no_coverage = sorted(set(os.listdir(games_root)) - set(detection) - {"media"})
     log(f"No CDN coverage ({len(no_coverage)}): {', '.join(no_coverage[:12])}"
         + (" ..." if len(no_coverage) > 12 else ""))
@@ -600,8 +690,17 @@ def main():
         filters = {s.strip() for s in cfg["systems"].split(",") if s.strip()}
         detection = {k: v for k, v in detection.items() if k in filters}
         log(f"config.ini filter active: {', '.join(sorted(detection))}")
+        if do_arcade and "_Arcade" not in filters and "arcade" not in {f.lower() for f in filters} \
+                and not args.arcade_only:
+            do_arcade = False
+            log("Arcade excluded by systems filter (add _Arcade to include it).")
 
-    if not detection:
+    if interactive and do_arcade and not args.arcade_only:
+        r = ask("Include arcade (_Arcade/*.mra)? (y/n)", "y").lower()
+        if r not in ("y", "yes"):
+            do_arcade = False
+
+    if not detection and not do_arcade:
         log("No systems to process.")
         sys.exit(0)
 
@@ -620,23 +719,61 @@ def main():
         listings[system] = {"main": main_idx, "bg": bg_idx}
         log(f"  {system:20s} {len(main_idx):6d} {source} keys, "
             f"{len(bg_idx):6d} {background} keys  ({time.time()-t0:.1f}s)")
+    if do_arcade:
+        t0 = time.time()
+        main_idx, bg_idx = {}, {}
+        for cdn in arcade_cdns:
+            main = load_listing(cache_dir, cdn, source, cfg["timeout"], cfg["retries"])
+            main_idx.update(build_index(cdn, main))
+            if background != "none" and background != source:
+                bg_n = load_listing(cache_dir, cdn, background, cfg["timeout"], cfg["retries"])
+                bg_idx.update(build_index(cdn, bg_n))
+        listings["_Arcade"] = {"main": main_idx, "bg": bg_idx}
+        log(f"  {'_Arcade':20s} {len(main_idx):6d} {source} keys, "
+            f"{len(bg_idx):6d} {background} keys  ({time.time()-t0:.1f}s)")
 
     # 3) Scan ROMs and prepare download jobs
     log("Scanning ROMs and matching artwork...")
     jobs, total_roms, misses = [], 0, {}
     per_system = {}
+    def artwork_urls(info, keys):
+        """First match wins across the given candidate keys. -> (url_main, url_bg)."""
+        p = b = None
+        for k in keys:
+            if p is None:
+                p = candidates(k, info["main"])
+            if b is None and info["bg"]:
+                b = candidates(k, info["bg"])
+            if p and (b or not info["bg"]):
+                break
+        url_p = f"{CDN}/{urllib.parse.quote(p[0])}/{SUBDIR_PATH[source]}/{urllib.parse.quote(p[1])}" if p else None
+        url_b = f"{CDN}/{urllib.parse.quote(b[0])}/{SUBDIR_PATH[background]}/{urllib.parse.quote(b[1])}" if b else None
+        return url_p, url_b
+
     for system, rom_dir, base in scan_roms(games_root, detection, args.limit):
         total_roms += 1
         per_system[system] = per_system.get(system, 0) + 1
-        info = listings[system]
-        p = candidates(base, info["main"])
-        b = candidates(base, info["bg"]) if info["bg"] else None
-        if not p and not b:
+        url_p, url_b = artwork_urls(listings[system], (base,))
+        if not url_p and not url_b:
             misses.setdefault(system, []).append(base)
             continue
-        url_p = f"{CDN}/{urllib.parse.quote(p[0])}/{SUBDIR_PATH[source]}/{urllib.parse.quote(p[1])}" if p else None
-        url_b = f"{CDN}/{urllib.parse.quote(b[0])}/{SUBDIR_PATH[background]}/{urllib.parse.quote(b[1])}" if b else None
         jobs.append((system, rom_dir, base, url_p, url_b))
+    if do_arcade:
+        n_arc = 0
+        for rom_dir, base, mra_path in scan_arcade(arcade_root, cfg["arcade_alternatives"], args.limit):
+            total_roms += 1
+            per_system["_Arcade"] = per_system.get("_Arcade", 0) + 1
+            keys = [base]
+            alt = parse_mra_name(mra_path)
+            if alt and alt.lower() != base.lower():
+                keys.append(alt)
+            url_p, url_b = artwork_urls(listings["_Arcade"], keys)
+            if not url_p and not url_b:
+                misses.setdefault("_Arcade", []).append(base)
+                continue
+            n_arc += 1
+            jobs.append(("_Arcade", rom_dir, base, url_p, url_b))
+        log(f"  _Arcade: {per_system.get('_Arcade', 0)} MRAs scanned, {n_arc} with artwork")
 
     log(f"ROMs scanned: {total_roms}   with artwork available: {len(jobs)}   without artwork: {total_roms - len(jobs)}")
     if not jobs:
@@ -732,6 +869,8 @@ def main():
     # 6) Optimized thumbnails (Console Mode's media/optimized/)
     if opt_enabled:
         optimize_pass(games_root, cfg["opt_max_w"], cfg["opt_max_h"], force=cfg["force"])
+        if do_arcade:
+            optimize_pass(arcade_root, cfg["opt_max_w"], cfg["opt_max_h"], force=cfg["force"])
     else:
         log("Optimized thumbnails skipped (--no-optimize). Console Mode will generate them on device.")
 

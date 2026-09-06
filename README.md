@@ -67,6 +67,10 @@ python3 cm_prescrape.py --optimize-only
 
 # Download without generating optimized thumbnails
 python3 cm_prescrape.py --all --no-optimize
+
+# Only scrape arcade (_Arcade/*.mra), or skip it
+python3 cm_prescrape.py --arcade-only
+python3 cm_prescrape.py --all --no-arcade
 ```
 
 When run in interactive mode:
@@ -96,15 +100,37 @@ When run in interactive mode:
 | `download_report.csv` | Per-system summary: total ROMs / with artwork / without artwork |
 | `no_artwork.csv` | Games with no artwork on the CDN (equivalent to Console Mode's `ScrapeLogs`) |
 
+## Arcade (`_Arcade/*.mra`)
+
+The MiSTer arcade folder lives outside `games/` (`_Arcade/*.mra` at the SD
+root) and is scraped automatically in the same run, using the `MAME` +
+`FBNeo - Arcade Games` CDN folders (the same long-title artwork the
+`games/Mame` zips use). Matching tries, in order:
+
+1. The `.mra` filename (`After Burner II.mra` → `After Burner II.png`),
+2. the `<name>` tag inside the `.mra` (e.g. `ASO.mra` →
+   `ASO - Armored Scrum Object`),
+3. spaceless variants (`280Z-ZZAP` → `280zzzap`, `3wonders` → `3 Wonders`).
+
+Artwork lands in `_Arcade/media/<game>.png` (+ `<game>-BG.png`), shows up as
+the `_Arcade` row in `download_report.csv`, and honors the same options
+(`--dry-run`, `--limit`, `force`, backgrounds, optimized thumbnails).
+
+```ini
+[arcade]
+enabled=1               ; 0 = never scrape _Arcade
+include_alternatives=0 ; 1 = also scrape _Arcade/_alternatives/*.mra
+```
+
+Select it explicitly with `--systems _Arcade`, or via `systems=_Arcade` in
+`config.ini`.
+
 ## Notes
 
-- **Arcade (`.mra`)**: the MAME folder on the CDN uses old MAME names while
-  your `.mra` files use modern names, so the arcade hit rate is low (the
-  original scraper would face the same on the device; Console Mode can also
-  complete it from its own menu). For arcade the most effective route is to
-  let Console Mode run its "Scrape Artwork" on the device (optionally after
-  configuring `ConsoleMode/screenscraper.txt`), or build the arcade artwork
-  with tools like ZapScraper + EasyMedia.
+- A few arcade titles have no artwork on the CDN (laserdisc games like
+  `Dragon's Lair`, multigame/test tapes, genuine CDN gaps such as
+  `280Z-ZZAP`/`Datsun 280 Zzzap`): they are listed in `no_artwork.csv` like
+  any other system.
 - Consoles and computers with small libretro coverage (VIC-20, ZX81, obscure
   European systems...) will have variable hit rates: this is exactly what
   Console Mode's default scraper would get on the device.
